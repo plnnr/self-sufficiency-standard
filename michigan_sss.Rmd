@@ -1,0 +1,140 @@
+---
+title: "Michigan Self-Sufficiency Standard"
+author: "Nick Kobel"
+date: "10/11/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r install-packages, include=FALSE}
+# Install required packages
+
+# pkgs <- c(
+#   "tidyverse",
+#   "tidycensus",
+#   "ggplot2",
+#   "hrbrthemes",
+#   "srvyr",
+#   "rio",
+#   "readxlsb",
+#   "knitr",
+#   "rmarkdown",
+#   "gt",
+#   "furrr",
+#   "tictoc"
+# )
+
+# install.packages(pkgs)
+```
+
+
+
+## The Self-Sufficiency Standard
+
+The Self-Sufficiency Standard (*The Standard* or SSS) is an improved alternative to the Federal Poverty Level (FPL) to measure the amount of money it takes for households to make ends meet. The Standard takes into consideration local cost variations of food, housing, transportation, child care, health care, and the interaction with state-level taxes and tax credits. Like FPL, it considers household size, but the Standard keenly adjusts for the differential costs of younger versus older children (i.e., childcare for an infant is vastly more expensive than for a more independent school-age child). [Rowe & Martin et al (2010, pg. 7-8)](https://pdxscholar.library.pdx.edu/metropolitianstudies/107/) discuss the benefits of using the Self-Sufficiency Standard over the Federal Poverty Level in greater detail. 
+
+The Standard is published by the [Center for Women's Welfare](http://www.selfsufficiencystandard.org/), typically partnering with state social service providors such as food security organizations or work force development agencies. The tables are published periodically (every 3 or 4 years), and they currently calculate the income needed to make ends meet for over 700 family type combinations for all county in the state. 
+
+The [United Way](https://www.unitedforalice.org/) uses the Self-Sufficiency Standard to estimate the distribution of Asset-Limited, Income-Constrained, Employed (ALICE) households, who are above FPL but below the Self-Sufficiency Standard.
+
+
+
+## Public Use Microdata Samples (PUMS)
+
+The Standard does not estimate the *number* of households who are above or below the income thresholds it sets, it merely states the household incomes that are needed to make ends meet without relying on government subsidies, free child care from a relative or neighbor, and to shelter your family without doubling up. To estimate how states are doing to meet the Standard, we must integrate the Standard with another dataset, the [American Community Survey (ACS) Public Use Microdata Samples (PUMS)](https://www.census.gov/programs-surveys/acs/microdata.html).
+
+## Examine the Self-Sufficiency Standard
+
+We start by loading in the requires libraries and setting the options for this analysis.
+
+
+```{r load-packages-set-options}
+library(tidyverse) # general data manipulation and graphing
+library(tidycensus) # pull ACS/PUMS data
+library(rio) # handle many different input/output file types
+library(readxlsb) # to read xlsb files for SSS
+library(ggplot2) # graph results
+library(scales) # number formatting
+library(srvyr) # survey functions
+library(gt) # making tables
+library(gtsummary)
+library(furrr) # parallel processing
+library(tictoc) # timing operations
+
+options(
+  scipen = 999, # remove scientific notation
+  digits = 4, # set data precision for readability
+  tigris_use_cache = T,
+  tigris_class = "sf", # call in TIGER spatial objects as simple features
+  stringsAsFactors = F, # string variables are brought in as charactors
+  dplyr.width = Inf,
+  survey.replicates.mse = T,
+  datatable.fread.datatable=F
+)
+
+# To deal with the random assignment of job loss and UI takeup for individuals,
+# we need to run generate the results multiple times with different random seeds
+# and then average the results. To speed this up we use {furrr} to run this in
+# parrallel across multiple cores.
+# plan(multiprocess)
+```
+
+Next, read in the 
+
+```{r read-sss-raw}
+# Set reference CPI for 2020
+REF_CPI_APPROX <- 385 # TODO Change when 2020 R-CPI-U-RS All Items is released; using this extrapolated preliminary estimate 
+
+# Set inflation adjustment factor to convert to 2020$
+CPI_ADJUST_2017 <- import("data/resources/cpi-u-rs_1950-current.xlsx") %>% 
+  mutate(inflation_factor_2020 = REF_CPI_APPROX / cpi ) %>% 
+  filter(year == 2017) %>% select(inflation_factor_2020) %>% pull()
+
+# Import 2020 and 2017 data
+sss_raw <- rbind(import("data/external/MI2020_SSS.xlsx", which = "By Family", 
+                  col_types = c("text", rep("numeric",5), "text", "numeric", "numeric", "text", rep("numeric", 14))),
+                 import("data/external/MI2017_all_families.xlsx", which = "By Family", 
+                  col_types = c("text", rep("numeric",5), "text", "numeric", "numeric", "text", rep("numeric", 14)))) %>%
+  janitor::clean_names() %>% 
+  rename(adults = adult_s, infants = infant_s, preschoolers = preshooler_s,
+         schoolagers = schoolager_s, teenagers = teenager_s)
+
+example_counties <- c("Wayne County", "Marquette County")
+
+sss_long <- sss_raw %>%
+  filter(family_type %in% c('a2i1p1s0t0', 'a1i0p0s1t0'),
+         county %in% example_counties) %>%
+  # select(-c(state:all_families_table_number)) %>%
+  select(year, county, family_type, housing_costs:emergency_savings) %>%
+  pivot_longer(-c(year, family_type, county), names_to = "line_item", values_to = "cost") %>%
+  mutate(line_item = gsub("_", " ", line_item) %>% str_to_title(., locale = "en") %>% gsub(" Costs", "", .),
+         line_group = case_when(line_item %in% c("Housing", "Child Care", "Food", "Transportation", "Health Care", "Miscellaneous") ~ "Costs",
+                                line_item %in% c("Taxes", "Earned Income Tax Credit", "Child Care Tax Credit") ~ "Tax Effects",
+                                line_item == "Emergency Savings" ~ "Other",
+                                T ~ "Minimum Income"),
+         family_type = case_when(family_type == "a2i1p1s0t0" ~ "Two adults, one infant, one pre-schooler",
+                                 family_type == "a1i0p0s1t0" ~ "One adult, one school-age child"),
+         cost = ifelse(year == 2017, cost * CPI_ADJUST_2017, cost)) %>% 
+  pivot_wider(id_cols = c(county, family_type, line_item, line_group), names_from = "year", values_from = c("cost")) %>%
+  arrange(desc(family_type))
+
+sss_long %>%
+  select(-line_group) %>%
+  group_by(county, family_type) %>%
+  gt(rowname_col = "line_item") %>%
+  tab_header(title = "Self-Sufficiency Standard",
+    subtitle = glue::glue("{example_counties[1]} & {example_counties[2]}") ) %>%
+  # tab_stubhead(label = "county") %>%
+  fmt_currency(columns = vars(`2020`, `2017`), currency = "USD", decimals = 0) #%>%
+  
+
+```
+
+
